@@ -34,6 +34,14 @@ Sony Computer Entertainment Wireless Controller
 
 ## Installation
 
+### Arch Linux (AUR)
+
+```sh
+yay -S jstimeout-git
+```
+
+### From source
+
 Build the binary:
 
 ```sh
