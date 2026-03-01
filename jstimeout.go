@@ -1,28 +1,29 @@
 /*
 
-Script to automatically disable the bluetooth gamepad when
+Program to automatically disconnect bluetooth gamepads when
 there is no activity for a specified time. It matches /dev/input
-with bluetooth mac addresses for DS3 controllers to force a 
-BT disconnect. This is necessary, because DS3 timeout cannot be 
-configured without a PS3 due to a proprietary timeout implementation 
-by Sony.
+with bluetooth mac addresses to force a BT disconnect. Originally
+written for DS3 controllers, whose timeout cannot be configured
+without a PS3 due to a proprietary timeout implementation by Sony,
+but works with any controller listed in the devices file.
 
 Use -m or -maxidletime arg to set idle time between 1s and 10800s (3h)
 The default idle time is 3600s (1h)
 
 Use -d or -devicefile to set the location to pull the device name list.
-This script defaults to the dot file in ".jstimeout.devices" to identify 
-controllers to monitor. Add names from /proc/bus/input/devices 
+Defaults to ".jstimeout.devices" in the current working directory to
+identify controllers to monitor. Add names from /proc/bus/input/devices
 for any additional controllers that need to be monitored.
 
-Мake the script executable and add it to autorun in desktop mode 
-or better yet a systemctl service to recover it if it crashes.i
+Make the binary executable and add it to autorun in desktop mode
+or better yet a systemctl service to recover it if it crashes.
 
 ################################################################
 ######                 Device List Setup                  ######
 ################################################################
 
-Devices file must be in same folder as the jstimeout binary.
+Devices file must be in the current working directory (or specify
+an absolute path via -d).
 
 ------
 ./.jstimeout.devices
@@ -71,7 +72,7 @@ it doesn't seem like a major problem to leave it running all the time via Option
 for my use case.
 
 The solution to have it terminate on disconnect entails creating systemd devices or 
-modifying the script to terminate when no devices are present. I prefer having the 
+modifying the program to terminate when no devices are present. I prefer having the 
 program monitor in an ongoing fashion, personally. To make the udev solution work, 
 you will need to modify and maintain udev rules should you add new devices. 
 
@@ -90,9 +91,9 @@ SUBSYSTEM=="input", ATTRS{name}=="Sony Computer Entertainment Wireless Controlle
 ------
 Commands 
 ------
-udev control --reload-rules
+udevadm control --reload-rules
 systemctl restart systemd-udevd.service
-udevadm monitor --enviroment --udev # to see it working on device connection
+udevadm monitor --environment --udev # to see it working on device connection
 
 */
 
