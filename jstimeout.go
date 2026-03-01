@@ -15,6 +15,10 @@ Defaults to ".jstimeout.devices" in the current working directory to
 identify controllers to monitor. Add names from /proc/bus/input/devices
 for any additional controllers that need to be monitored.
 
+Use -deadzone to set the axis deadzone threshold (0-32767). Axis events
+with |value| below this are ignored as stick drift. Default is 6000
+(~18% of full range).
+
 Make the binary executable and add it to autorun in desktop mode
 or better yet a systemctl service to recover it if it crashes.
 
@@ -53,7 +57,7 @@ RestartSec=5
 WantedBy=default.target
 
 ------
-Commands 
+Commands
 ------
 systemctl daemon-reload
 systemctl enable --user jstimeout.service
@@ -64,20 +68,20 @@ journalctl -u jstimeout.service --user -b -e -f # to see it working on
 ######            [Opt 2] UDev Service Launch             ######
 ################################################################
 
-Option 2 entails needing root access to modify udev rules so the process 
-is initiated only when specific devices are connected. This is a great 
-way to minimize running processes, but I found it does not stop when controllers 
+Option 2 entails needing root access to modify udev rules so the process
+is initiated only when specific devices are connected. This is a great
+way to minimize running processes, but I found it does not stop when controllers
 are gone which mitigates the benefit. The binary uses very minimal resources so
-it doesn't seem like a major problem to leave it running all the time via Option 1 
+it doesn't seem like a major problem to leave it running all the time via Option 1
 for my use case.
 
-The solution to have it terminate on disconnect entails creating systemd devices or 
-modifying the program to terminate when no devices are present. I prefer having the 
-program monitor in an ongoing fashion, personally. To make the udev solution work, 
-you will need to modify and maintain udev rules should you add new devices. 
+The solution to have it terminate on disconnect entails creating systemd devices or
+modifying the program to terminate when no devices are present. I prefer having the
+program monitor in an ongoing fashion, personally. To make the udev solution work,
+you will need to modify and maintain udev rules should you add new devices.
 
-The below rules will launch the existing user service we previously configured. You'll 
-want to disable auto-launch (disable) the user service. I explored "StopWhenNeeded" as 
+The below rules will launch the existing user service we previously configured. You'll
+want to disable auto-launch (disable) the user service. I explored "StopWhenNeeded" as
 an option for stopping the systemd service, but that did not make the service terminate
 when devices disconnected.
 
@@ -89,7 +93,7 @@ SUBSYSTEM=="input", ATTRS{name}=="Sony PLAYSTATION(R)3 Controller", TAG+="system
 SUBSYSTEM=="input", ATTRS{name}=="Sony Computer Entertainment Wireless Controller", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="jstimeout.service"
 
 ------
-Commands 
+Commands
 ------
 udevadm control --reload-rules
 systemctl restart systemd-udevd.service
@@ -101,16 +105,34 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"os"
-	"os/exec" // For executing shell commands
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
 )
 
-const eventSize = 24 // Size of struct "llHHI" (as per the Python code)
+const (
+	jsEventSize = 8 // sizeof(struct js_event): __u32 + __s16 + __u8 + __u8
+
+	// Event type constants from linux/joystick.h
+	jsEventButton = 0x01 // button pressed/released
+	jsEventAxis   = 0x02 // joystick moved
+	jsEventInit   = 0x80 // OR'd with type for synthetic initial state events
+)
+
+// JsEvent represents the Linux js_event struct from /dev/input/jsX.
+// Layout: { __u32 time; __s16 value; __u8 type; __u8 number; }
+type JsEvent struct {
+	Time   uint32
+	Value  int16
+	Type   uint8
+	Number uint8
+}
 
 var specificNames []string
 
@@ -120,13 +142,12 @@ type Device struct {
 	Handlers []string
 }
 
-// Function to read device names from the file
 func loadSpecificNames(filePath string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %v", err)
 	}
-	defer file.Close()
+	defer file.Close() //nolint:errcheck // read-only
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -143,16 +164,46 @@ func loadSpecificNames(filePath string) error {
 	return nil
 }
 
-func parseInputDevices() ([]Device, error) {
-	file, err := os.Open("/proc/bus/input/devices")
-	if err != nil {
-		return nil, fmt.Errorf("failed to open devices: %v", err)
+// parseJsEvent parses 8 bytes from /dev/input/jsX into a JsEvent.
+func parseJsEvent(buf []byte) (JsEvent, error) {
+	if len(buf) != jsEventSize {
+		return JsEvent{}, fmt.Errorf("expected %d bytes, got %d", jsEventSize, len(buf))
 	}
-	defer file.Close()
+	return JsEvent{
+		Time:   binary.LittleEndian.Uint32(buf[0:4]),
+		Value:  int16(binary.LittleEndian.Uint16(buf[4:6])),
+		Type:   buf[6],
+		Number: buf[7],
+	}, nil
+}
 
+// isSignificantEvent returns true if the event represents genuine user input.
+// Init events (type & 0x80) are always ignored.
+// Button events always count. Axis events only count if |value| >= deadzone.
+func isSignificantEvent(ev JsEvent, deadzone int16) bool {
+	if ev.Type&jsEventInit != 0 {
+		return false
+	}
+
+	switch ev.Type {
+	case jsEventButton:
+		return true
+	case jsEventAxis:
+		v := int32(ev.Value)
+		if v < 0 {
+			v = -v
+		}
+		return v >= int32(deadzone)
+	default:
+		return false
+	}
+}
+
+// parseInputDevicesFromReader parses the /proc/bus/input/devices format from any reader.
+func parseInputDevicesFromReader(r io.Reader) ([]Device, error) {
 	var devices []Device
 	var currentDevice Device
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(r)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -184,7 +235,16 @@ func parseInputDevices() ([]Device, error) {
 	return devices, nil
 }
 
-func inputChecker(devPath string, uniq string, deviceEvent chan struct{}, quit chan bool) {
+func parseInputDevices() ([]Device, error) {
+	file, err := os.Open("/proc/bus/input/devices")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open devices: %v", err)
+	}
+	defer file.Close() //nolint:errcheck // read-only
+	return parseInputDevicesFromReader(file)
+}
+
+func inputChecker(devPath string, uniq string, deviceEvent chan struct{}, quit chan bool, deadzone int16) {
 	fmt.Printf("Checking input on device: %s (%s)\n", uniq, devPath)
 
 	file, err := os.Open(devPath)
@@ -192,9 +252,9 @@ func inputChecker(devPath string, uniq string, deviceEvent chan struct{}, quit c
 		fmt.Printf("Failed to open device %s: %v\n", uniq, err)
 		return
 	}
-	defer file.Close()
+	defer file.Close() //nolint:errcheck // read-only
 
-	buffer := make([]byte, eventSize)
+	buf := make([]byte, jsEventSize)
 
 	for {
 		select {
@@ -202,25 +262,28 @@ func inputChecker(devPath string, uniq string, deviceEvent chan struct{}, quit c
 			fmt.Printf("Stopping input check for device %s\n", uniq)
 			return
 		default:
-			// Read the input event (non-blocking read)
-			n, err := file.Read(buffer)
+			n, err := file.Read(buf)
 			if err != nil {
-				// Handle EOF or other errors
 				fmt.Printf("Error reading event from device %s: %v\n", uniq, err)
 				return
 			}
+			if n != jsEventSize {
+				continue
+			}
 
-			if n > 0 {
-				// Signal input detected by setting the event
+			ev, err := parseJsEvent(buf)
+			if err != nil {
+				continue
+			}
+
+			if isSignificantEvent(ev, deadzone) {
 				deviceEvent <- struct{}{}
-                // Commenting out to de-clutter logs
-				// fmt.Printf("Input detected for device %s\n", uniq)
 			}
 		}
 	}
 }
 
-func monitorDevice(devPath string, uniq string, maxIdle time.Duration, wg *sync.WaitGroup, quit chan bool) {
+func monitorDevice(devPath string, uniq string, maxIdle time.Duration, wg *sync.WaitGroup, quit chan bool, deadzone int16) {
 	defer wg.Done()
 	fmt.Printf("Monitoring device: %s (%s)\n", uniq, devPath)
 
@@ -229,7 +292,7 @@ func monitorDevice(devPath string, uniq string, maxIdle time.Duration, wg *sync.
 	defer ticker.Stop()
 
 	deviceEvent := make(chan struct{})
-	go inputChecker(devPath, uniq, deviceEvent, quit)
+	go inputChecker(devPath, uniq, deviceEvent, quit, deadzone)
 
 	for {
 		select {
@@ -237,12 +300,8 @@ func monitorDevice(devPath string, uniq string, maxIdle time.Duration, wg *sync.
 			fmt.Printf("Stopping monitoring for device %s\n", uniq)
 			return
 		case <-deviceEvent:
-			// Reset idle timer when input is detected
 			idleSince = time.Now()
-            // Commenting out to de-clutter logs
-			// fmt.Printf("Resetting idle timer for device %s\n", uniq)
 		case <-ticker.C:
-			// Check if the device has been idle for too long
 			idleDuration := time.Since(idleSince)
 			if idleDuration >= maxIdle {
 				fmt.Printf("Device %s idle for %v, disconnecting...\n", uniq, idleDuration)
@@ -268,8 +327,16 @@ func main() {
 	maxIdleShort := flag.Int("m", 3600, "Maximum idle time in seconds (1-10800)")
 	filePath := flag.String("devicefile", ".jstimeout.devices", "Path to the file with device names")
 	filePathShort := flag.String("d", ".jstimeout.devices", "Path to the file with device names")
+	deadzoneFlag := flag.Int("deadzone", 6000, "Axis deadzone threshold (0-32767)")
 
 	flag.Parse()
+
+	// Validate deadzone
+	if *deadzoneFlag < 0 || *deadzoneFlag > 32767 {
+		fmt.Println("Error: deadzone must be between 0 and 32,767")
+		os.Exit(1)
+	}
+	deadzone := int16(*deadzoneFlag)
 
 	// Validate max idle time
 	idleValue := *maxIdle
@@ -281,15 +348,15 @@ func main() {
 		os.Exit(1)
 	}
 
-    // Validate device file
+	// Validate device file
 	deviceFilePath := *filePath
 	if *filePathShort != ".jstimeout.devices" {
 		deviceFilePath = *filePathShort
 	}
 
-    fmt.Printf("Using device file: %s\n", deviceFilePath)
+	fmt.Printf("Using device file: %s\n", deviceFilePath)
 
-    // Load device names from file
+	// Load device names from file
 	if err := loadSpecificNames(deviceFilePath); err != nil {
 		fmt.Printf("Error loading device names: %v\n", err)
 		return
@@ -303,6 +370,7 @@ func main() {
 
 	idleDuration := time.Duration(idleValue) * time.Second
 	fmt.Printf("Max idle time set to: %v seconds\n", idleDuration.Seconds())
+	fmt.Printf("Axis deadzone set to: %d\n", deadzone)
 
 	deviceQuitChannels := make(map[string]chan bool)
 	var mu sync.Mutex
@@ -327,7 +395,7 @@ func main() {
 						deviceQuitChannels[device.Uniq] = quit
 						var wg sync.WaitGroup
 						wg.Add(1)
-						go monitorDevice("/dev/input/"+handler, device.Uniq, idleDuration, &wg, quit)
+						go monitorDevice("/dev/input/"+handler, device.Uniq, idleDuration, &wg, quit, deadzone)
 					}
 				}
 			}

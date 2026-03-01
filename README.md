@@ -7,13 +7,14 @@ Originally written for DS3 controllers, whose timeout cannot be configured witho
 ## Usage
 
 ```
-jstimeout [-m|-maxidletime <seconds>] [-d|-devicefile <path>]
+jstimeout [-m|-maxidletime <seconds>] [-d|-devicefile <path>] [-deadzone <threshold>]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-m`, `-maxidletime` | `3600` (1h) | Idle time in seconds before disconnect (1-10800) |
 | `-d`, `-devicefile` | `.jstimeout.devices` | Path to the file with device names |
+| `-deadzone` | `6000` (~18%) | Axis deadzone threshold (0-32767); events below this are ignored as stick drift |
 
 ## Device List Setup
 
