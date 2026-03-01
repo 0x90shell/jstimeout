@@ -18,7 +18,14 @@ jstimeout [-m|-maxidletime <seconds>] [-d|-devicefile <path>] [-deadzone <thresh
 
 ## Device List Setup
 
-Create a `.jstimeout.devices` file in the current working directory (or specify an absolute path via `-d`). Add device names as they appear in `/proc/bus/input/devices`, one per line.
+Without `-d`, the program looks for the device list in this order:
+
+1. `.jstimeout.devices` in the current working directory
+2. `~/.config/jstimeout/devices`
+
+If neither exists and the package-provided example (`/usr/share/jstimeout/devices.example`) is available, it is automatically copied to `~/.config/jstimeout/devices` on first run.
+
+Add device names as they appear in `/proc/bus/input/devices`, one per line.
 
 ```
 Sony PLAYSTATION(R)3 Controller

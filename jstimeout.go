@@ -11,9 +11,12 @@ Use -m or -maxidletime arg to set idle time between 1s and 10800s (3h)
 The default idle time is 3600s (1h)
 
 Use -d or -devicefile to set the location to pull the device name list.
-Defaults to ".jstimeout.devices" in the current working directory to
-identify controllers to monitor. Add names from /proc/bus/input/devices
-for any additional controllers that need to be monitored.
+Without -d, the program checks for ".jstimeout.devices" in the current
+working directory first, then ~/.config/jstimeout/devices. If neither
+exists but the system example (/usr/share/jstimeout/devices.example)
+is present, it is copied to ~/.config/jstimeout/devices automatically.
+Add names from /proc/bus/input/devices for any additional controllers
+that need to be monitored.
 
 Use -deadzone to set the axis deadzone threshold (0-32767). Axis events
 with |value| below this are ignored as stick drift. Default is 6000
@@ -26,8 +29,10 @@ or better yet a systemctl service to recover it if it crashes.
 ######                 Device List Setup                  ######
 ################################################################
 
-Devices file must be in the current working directory (or specify
-an absolute path via -d).
+Devices file lookup order (without -d):
+  1. ./.jstimeout.devices  (current working directory)
+  2. ~/.config/jstimeout/devices
+  3. Auto-copy from /usr/share/jstimeout/devices.example to #2
 
 ------
 ./.jstimeout.devices
@@ -111,6 +116,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -134,12 +140,60 @@ type JsEvent struct {
 	Number uint8
 }
 
+const systemExample = "/usr/share/jstimeout/devices.example"
+
 var specificNames []string
 
 type Device struct {
 	Name     string
 	Uniq     string
 	Handlers []string
+}
+
+// resolveDeviceFile finds the device list file. If the user didn't override
+// with -d, it checks CWD first, then ~/.config/jstimeout/devices. If neither
+// exists but the system example does, it copies it to the XDG path.
+func resolveDeviceFile(path string, userOverride bool) string {
+	if userOverride {
+		return path
+	}
+
+	// Check CWD first (original behavior)
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	xdgPath := filepath.Join(home, ".config", "jstimeout", "devices")
+
+	// Check XDG config path
+	if _, err := os.Stat(xdgPath); err == nil {
+		return xdgPath
+	}
+
+	// Copy system example to XDG path if available
+	if _, err := os.Stat(systemExample); err == nil {
+		if err := os.MkdirAll(filepath.Dir(xdgPath), 0755); err != nil {
+			fmt.Printf("Warning: could not create config dir: %v\n", err)
+			return path
+		}
+		src, err := os.ReadFile(systemExample)
+		if err != nil {
+			fmt.Printf("Warning: could not read %s: %v\n", systemExample, err)
+			return path
+		}
+		if err := os.WriteFile(xdgPath, src, 0644); err != nil {
+			fmt.Printf("Warning: could not write %s: %v\n", xdgPath, err)
+			return path
+		}
+		fmt.Printf("Copied default device list to %s — edit it to add your controllers\n", xdgPath)
+		return xdgPath
+	}
+
+	return path
 }
 
 func loadSpecificNames(filePath string) error {
@@ -348,11 +402,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Validate device file
+	// Resolve device file — use flag.Visit to detect if -d or -devicefile was explicitly set
 	deviceFilePath := *filePath
-	if *filePathShort != ".jstimeout.devices" {
-		deviceFilePath = *filePathShort
-	}
+	userOverride := false
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "d":
+			deviceFilePath = *filePathShort
+			userOverride = true
+		case "devicefile":
+			userOverride = true
+		}
+	})
+	deviceFilePath = resolveDeviceFile(deviceFilePath, userOverride)
 
 	fmt.Printf("Using device file: %s\n", deviceFilePath)
 
