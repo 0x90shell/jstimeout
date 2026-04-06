@@ -57,16 +57,14 @@ go build -o jstimeout jstimeout.go
 
 ## Systemd User Service
 
-AUR packages install a service file to `/usr/share/jstimeout/`. To enable:
+AUR packages install a service file to `/usr/lib/systemd/user/`. To enable:
 
 ```sh
-mkdir -p ~/.config/systemd/user
-cp /usr/share/jstimeout/jstimeout.service ~/.config/systemd/user/
 systemctl --user enable --now jstimeout
 journalctl --user -u jstimeout -b -e -f  # view logs
 ```
 
-If building from source, copy `jstimeout.service` from the repo and edit `ExecStart` to your binary path.
+If building from source, copy `jstimeout.service` to `/usr/lib/systemd/user/` or `~/.config/systemd/user/` and edit `ExecStart` to your binary path.
 
 ### Option 2: UDev Service Launch
 
