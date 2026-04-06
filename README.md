@@ -55,33 +55,18 @@ Build the binary:
 go build -o jstimeout jstimeout.go
 ```
 
-Make the binary executable and add it to autorun in desktop mode, or better yet a systemctl service to recover it if it crashes.
+## Systemd User Service
 
-### Option 1: User Service (Recommended)
-
-Substitute `ExecStart` to the path for your jstimeout binary.
-
-`~/.config/systemd/user/jstimeout.service`
-```ini
-[Unit]
-Description=jstimeout daemon
-After=network.target auditd.service
-[Service]
-ExecStartPre=/bin/sleep 10
-Type=idle
-ExecStart=/home/user/bin/jstimeout
-Restart=on-failure
-RestartSec=5
-[Install]
-WantedBy=default.target
-```
+AUR packages install a service file to `/usr/share/jstimeout/`. To enable:
 
 ```sh
-systemctl daemon-reload
-systemctl enable --user jstimeout.service
-systemctl start --user jstimeout.service
-journalctl -u jstimeout.service --user -b -e -f  # view logs
+mkdir -p ~/.config/systemd/user
+cp /usr/share/jstimeout/jstimeout.service ~/.config/systemd/user/
+systemctl --user enable --now jstimeout
+journalctl --user -u jstimeout -b -e -f  # view logs
 ```
+
+If building from source, copy `jstimeout.service` from the repo and edit `ExecStart` to your binary path.
 
 ### Option 2: UDev Service Launch
 
