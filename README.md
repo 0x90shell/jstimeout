@@ -67,7 +67,21 @@ systemctl --user enable --now jstimeout
 journalctl --user -u jstimeout -b -e -f  # view logs
 ```
 
-The service waits 10 seconds before starting to give the Bluetooth subsystem time to initialize.
+The service waits 10 seconds before starting to give the Bluetooth subsystem time to initialize. The default idle timeout is 1 hour. To change it, create a systemd override:
+
+```sh
+systemctl --user edit jstimeout
+```
+
+Then add:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/jstimeout -m 1800
+```
+
+The blank `ExecStart=` line is required to clear the default before setting your own.
 
 ### Option 2: UDev Service Launch
 
