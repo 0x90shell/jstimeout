@@ -1,0 +1,13 @@
+[Unit]
+Description=jstimeout daemon
+After=network.target
+
+[Service]
+ExecStartPre=/bin/sleep 10
+Type=idle
+ExecStart=/usr/bin/jstimeout
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

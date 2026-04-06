@@ -37,7 +37,14 @@ Sony Computer Entertainment Wireless Controller
 ### Arch Linux (AUR)
 
 ```sh
-yay -S jstimeout-git
+yay -S jstimeout-bin   # pre-built binary from GitHub release
+yay -S jstimeout-git   # build from latest source
+```
+
+To auto-update `-git` packages when upstream changes, enable devel checking:
+
+```sh
+yay --devel --save
 ```
 
 ### From source
