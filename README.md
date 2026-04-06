@@ -67,6 +67,8 @@ systemctl --user enable --now jstimeout
 journalctl --user -u jstimeout -b -e -f  # view logs
 ```
 
+The service waits 10 seconds before starting to give the Bluetooth subsystem time to initialize.
+
 ### Option 2: UDev Service Launch
 
 Option 2 entails needing root access to modify udev rules so the process is initiated only when specific devices are connected. This is a great way to minimize running processes, but it does not stop when controllers are gone which mitigates the benefit. The binary uses very minimal resources so it doesn't seem like a major problem to leave it running all the time via Option 1.
