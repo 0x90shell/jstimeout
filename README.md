@@ -49,22 +49,23 @@ yay --devel --save
 
 ### From source
 
-Build the binary:
-
 ```sh
+git clone https://github.com/0x90shell/jstimeout.git
+cd jstimeout
 go build -o jstimeout jstimeout.go
+sudo install -Dm755 jstimeout /usr/bin/jstimeout
+sudo install -Dm644 .jstimeout.devices /usr/share/jstimeout/devices.example
+sudo install -Dm644 jstimeout.service /usr/lib/systemd/user/jstimeout.service
 ```
 
 ## Systemd User Service
 
-AUR packages install a service file to `/usr/lib/systemd/user/`. To enable:
+To enable:
 
 ```sh
 systemctl --user enable --now jstimeout
 journalctl --user -u jstimeout -b -e -f  # view logs
 ```
-
-If building from source, copy `jstimeout.service` to `/usr/lib/systemd/user/` or `~/.config/systemd/user/` and edit `ExecStart` to your binary path.
 
 ### Option 2: UDev Service Launch
 
