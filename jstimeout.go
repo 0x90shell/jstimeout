@@ -1,122 +1,17 @@
-/*
-
-Program to automatically disconnect bluetooth gamepads when
-there is no activity for a specified time. It matches /dev/input
-with bluetooth mac addresses to force a BT disconnect. Originally
-written for DS3 controllers, whose timeout cannot be configured
-without a PS3 due to a proprietary timeout implementation by Sony,
-but works with any controller listed in the devices file.
-
-Use -m or -maxidletime arg to set idle time between 1s and 10800s (3h)
-The default idle time is 3600s (1h)
-
-Use -d or -devicefile to set the location to pull the device name list.
-Without -d, the program checks for ".jstimeout.devices" in the current
-working directory first, then ~/.config/jstimeout/devices. If neither
-exists but the system example (/usr/share/jstimeout/devices.example)
-is present, it is copied to ~/.config/jstimeout/devices automatically.
-Add names from /proc/bus/input/devices for any additional controllers
-that need to be monitored.
-
-Use -deadzone to set the axis deadzone threshold (0-32767). Axis events
-with |value| below this are ignored as stick drift. Default is 6000
-(~18% of full range).
-
-Make the binary executable and add it to autorun in desktop mode
-or better yet a systemctl service to recover it if it crashes.
-
-################################################################
-######                 Device List Setup                  ######
-################################################################
-
-Devices file lookup order (without -d):
-  1. ./.jstimeout.devices  (current working directory)
-  2. ~/.config/jstimeout/devices
-  3. Auto-copy from /usr/share/jstimeout/devices.example to #2
-
-------
-./.jstimeout.devices
-------
-Sony PLAYSTATION(R)3 Controller
-Sony Computer Entertainment Wireless Controller
-
-################################################################
-######            [Opt 1] User Service Setup              ######
-################################################################
-
-Substitute exec start to the path for the jstimeout binary.
-
--------
-~/.config/systemd/user/jstimeout.service
-------
-[Unit]
-Description=jstimeout daemon
-After=network.target auditd.service
-[Service]
-ExecStartPre=/bin/sleep 10
-Type=idle
-ExecStart=/home/user/bin/jstimeout
-Restart=on-failure
-RestartSec=5
-[Install]
-WantedBy=default.target
-
-------
-Commands
-------
-systemctl daemon-reload
-systemctl enable --user jstimeout.service
-systemctl start --user jstimeout.service
-journalctl -u jstimeout.service --user -b -e -f # to see it working on
-
-################################################################
-######            [Opt 2] UDev Service Launch             ######
-################################################################
-
-Option 2 entails needing root access to modify udev rules so the process
-is initiated only when specific devices are connected. This is a great
-way to minimize running processes, but I found it does not stop when controllers
-are gone which mitigates the benefit. The binary uses very minimal resources so
-it doesn't seem like a major problem to leave it running all the time via Option 1
-for my use case.
-
-The solution to have it terminate on disconnect entails creating systemd devices or
-modifying the program to terminate when no devices are present. I prefer having the
-program monitor in an ongoing fashion, personally. To make the udev solution work,
-you will need to modify and maintain udev rules should you add new devices.
-
-The below rules will launch the existing user service we previously configured. You'll
-want to disable auto-launch (disable) the user service. I explored "StopWhenNeeded" as
-an option for stopping the systemd service, but that did not make the service terminate
-when devices disconnected.
-
----
-/etc/udev/rules.d/99-jstimeout.rules
----
-# Rule for launching the jstimeout program for specific gamepads
-SUBSYSTEM=="input", ATTRS{name}=="Sony PLAYSTATION(R)3 Controller", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="jstimeout.service"
-SUBSYSTEM=="input", ATTRS{name}=="Sony Computer Entertainment Wireless Controller", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="jstimeout.service"
-
-------
-Commands
-------
-udevadm control --reload-rules
-systemctl restart systemd-udevd.service
-udevadm monitor --environment --udev # to see it working on device connection
-
-*/
-
+// Package main implements jstimeout, a daemon that auto-disconnects idle
+// Bluetooth gamepads after a configurable timeout.
 package main
 
 import (
 	"bufio"
 	"encoding/binary"
-	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -131,6 +26,20 @@ const (
 	jsEventInit   = 0x80 // OR'd with type for synthetic initial state events
 )
 
+var version = "2.0.0"
+var verbose bool
+
+// Config holds runtime settings parsed from config file and CLI flags.
+type Config struct {
+	MaxIdle  int
+	Deadzone int
+	Names    []string
+}
+
+func defaultConfig() Config {
+	return Config{MaxIdle: 3600, Deadzone: 6000}
+}
+
 // JsEvent represents the Linux js_event struct from /dev/input/jsX.
 // Layout: { __u32 time; __s16 value; __u8 type; __u8 number; }
 type JsEvent struct {
@@ -140,83 +49,263 @@ type JsEvent struct {
 	Number uint8
 }
 
-const systemExample = "/usr/share/jstimeout/devices.example"
-
-var specificNames []string
-
+// Device represents a matched input device from /proc/bus/input/devices.
 type Device struct {
 	Name     string
 	Uniq     string
 	Handlers []string
 }
 
-// resolveDeviceFile finds the device list file. If the user didn't override
-// with -d, it checks CWD first, then ~/.config/jstimeout/devices. If neither
-// exists but the system example does, it copies it to the XDG path.
-func resolveDeviceFile(path string, userOverride bool) string {
-	if userOverride {
-		return path
-	}
+// --- Color helpers (TTY-aware) ---
 
-	// Check CWD first (original behavior)
-	if _, err := os.Stat(path); err == nil {
-		return path
-	}
-
-	home, err := os.UserHomeDir()
+func isTTY() bool {
+	fi, err := os.Stdout.Stat()
 	if err != nil {
-		return path
+		return false
 	}
-	xdgPath := filepath.Join(home, ".config", "jstimeout", "devices")
-
-	// Check XDG config path
-	if _, err := os.Stat(xdgPath); err == nil {
-		return xdgPath
-	}
-
-	// Copy system example to XDG path if available
-	if _, err := os.Stat(systemExample); err == nil {
-		if err := os.MkdirAll(filepath.Dir(xdgPath), 0755); err != nil {
-			fmt.Printf("Warning: could not create config dir: %v\n", err)
-			return path
-		}
-		src, err := os.ReadFile(systemExample)
-		if err != nil {
-			fmt.Printf("Warning: could not read %s: %v\n", systemExample, err)
-			return path
-		}
-		if err := os.WriteFile(xdgPath, src, 0644); err != nil {
-			fmt.Printf("Warning: could not write %s: %v\n", xdgPath, err)
-			return path
-		}
-		fmt.Printf("Copied default device list to %s — edit it to add your controllers\n", xdgPath)
-		return xdgPath
-	}
-
-	return path
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
-func loadSpecificNames(filePath string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to open file: %v", err)
+func colorRed(s string) string {
+	if isTTY() {
+		return "\033[1;31m" + s + "\033[0m"
 	}
-	defer file.Close() //nolint:errcheck // read-only
+	return s
+}
 
-	scanner := bufio.NewScanner(file)
+//nolint:unparam // called with constant now, but designed for general use
+func colorGreen(s string) string {
+	if isTTY() {
+		return "\033[1;32m" + s + "\033[0m"
+	}
+	return s
+}
+
+//nolint:unparam // called with constant now, but designed for general use
+func colorYellow(s string) string {
+	if isTTY() {
+		return "\033[1;33m" + s + "\033[0m"
+	}
+	return s
+}
+
+func colorDim(s string) string {
+	if isTTY() {
+		return "\033[2m" + s + "\033[0m"
+	}
+	return s
+}
+
+func debugf(format string, args ...any) {
+	if verbose {
+		fmt.Printf(format+"\n", args...)
+	}
+}
+
+// --- INI config parser ---
+
+const (
+	systemConfigExample = "/usr/share/jstimeout/config.example"
+	legacySystemExample = "/usr/share/jstimeout/devices.example"
+)
+
+// parseConfig reads an INI-style config file into a Config.
+// [settings] section has key=value pairs; [devices] section has one name per line.
+func parseConfig(r io.Reader) (Config, error) {
+	cfg := defaultConfig()
+	scanner := bufio.NewScanner(r)
+	section := ""
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			specificNames = append(specificNames, line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Section header
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.ToLower(line[1 : len(line)-1])
+			continue
+		}
+
+		switch section {
+		case "settings":
+			// Strip inline comments
+			if idx := strings.Index(line, "#"); idx > 0 {
+				line = strings.TrimSpace(line[:idx])
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			switch key {
+			case "maxidle":
+				if n, err := strconv.Atoi(val); err == nil {
+					cfg.MaxIdle = n
+				}
+			case "deadzone":
+				if n, err := strconv.Atoi(val); err == nil {
+					cfg.Deadzone = n
+				}
+			default:
+				debugf("Warning: unknown config key: %s", key)
+			}
+		case "devices":
+			cfg.Names = append(cfg.Names, line)
+		default:
+			// Unknown section - skip silently for forward-compat
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading file: %v", err)
+		return cfg, fmt.Errorf("reading config: %w", err)
+	}
+	return cfg, nil
+}
+
+// loadConfig reads config from the given path.
+func loadConfig(path string) (Config, error) {
+	file, err := os.Open(path) //nolint:gosec // G304: path from config resolution, not user-controlled
+	if err != nil {
+		return defaultConfig(), fmt.Errorf("opening config: %w", err)
+	}
+	defer file.Close() //nolint:errcheck // read-only
+	return parseConfig(file)
+}
+
+// migrateConfig reads a legacy device file, writes a new INI config, and
+// renames the legacy file to .v1.bak. Returns the new config path.
+func migrateConfig(legacyPath string, newPath string) (string, error) {
+	file, err := os.Open(legacyPath) //nolint:gosec // G304: path from known legacy locations
+	if err != nil {
+		return "", fmt.Errorf("opening legacy file: %w", err)
+	}
+	defer file.Close() //nolint:errcheck // read-only
+
+	var names []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			names = append(names, line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("reading legacy file: %w", err)
 	}
 
+	// Build new config content
+	var b strings.Builder
+	b.WriteString("# jstimeout configuration (migrated from legacy device file)\n")
+	b.WriteString("# CLI flags override these values\n\n")
+	b.WriteString("[settings]\n")
+	b.WriteString("maxidle = 3600      # idle timeout in seconds (1-10800)\n")
+	b.WriteString("deadzone = 6000     # axis deadzone threshold (0-32767)\n\n")
+	b.WriteString("[devices]\n")
+	for _, name := range names {
+		b.WriteString(name + "\n")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil { //nolint:gosec // G301: XDG config dir
+		return "", fmt.Errorf("creating config dir: %w", err)
+	}
+	if err := os.WriteFile(newPath, []byte(b.String()), 0644); err != nil { //nolint:gosec // G306: user config, world-readable
+		return "", fmt.Errorf("writing config: %w", err)
+	}
+
+	bakPath := legacyPath + ".v1.bak"
+	if err := os.Rename(legacyPath, bakPath); err != nil {
+		fmt.Printf("Warning: could not rename %s to %s: %v\n", legacyPath, bakPath, err)
+	}
+
+	fmt.Printf("Migrated %s → %s (old file renamed to %s)\n", legacyPath, newPath, bakPath)
+	return newPath, nil
+}
+
+// resolveConfig finds the config file. Returns (path, found).
+func resolveConfig(configFlag string) (string, bool) {
+	// Explicit flag overrides everything
+	if configFlag != "" {
+		return configFlag, true
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", false
+	}
+
+	xdgConfig := filepath.Join(home, ".config", "jstimeout", "config")
+	etcConfig := "/etc/jstimeout/config"
+
+	// Check new INI config locations
+	for _, p := range []string{xdgConfig, etcConfig} {
+		if _, err := os.Stat(p); err == nil {
+			return p, true
+		}
+	}
+
+	// Auto-copy system example
+	if _, err := os.Stat(systemConfigExample); err == nil {
+		if err := os.MkdirAll(filepath.Dir(xdgConfig), 0755); err == nil { //nolint:gosec // G301: XDG config dir
+			if src, err := os.ReadFile(systemConfigExample); err == nil {
+				if err := os.WriteFile(xdgConfig, src, 0644); err == nil { //nolint:gosec // G306: user config, world-readable
+					fmt.Printf("Created default config at %s\n", xdgConfig)
+					return xdgConfig, true
+				}
+			}
+		}
+	}
+
+	// Legacy auto-migration: find old device file, convert to new config
+	legacyPaths := []string{".jstimeout.devices", filepath.Join(home, ".config", "jstimeout", "devices")}
+	for _, p := range legacyPaths {
+		if _, err := os.Stat(p); err == nil {
+			newPath, err := migrateConfig(p, xdgConfig)
+			if err != nil {
+				fmt.Printf("Warning: migration failed for %s: %v\n", p, err)
+				continue
+			}
+			return newPath, true
+		}
+	}
+
+	// Legacy auto-copy from system example (for fresh installs with only old-format example)
+	if _, err := os.Stat(legacySystemExample); err == nil {
+		legacyXDG := filepath.Join(home, ".config", "jstimeout", "devices")
+		if err := os.MkdirAll(filepath.Dir(legacyXDG), 0755); err == nil { //nolint:gosec // G301: XDG config dir
+			if src, err := os.ReadFile(legacySystemExample); err == nil {
+				if err := os.WriteFile(legacyXDG, src, 0644); err == nil { //nolint:gosec // G306: user config
+					// Immediately migrate the freshly copied legacy file
+					newPath, err := migrateConfig(legacyXDG, xdgConfig)
+					if err != nil {
+						fmt.Printf("Warning: migration failed: %v\n", err)
+						return "", false
+					}
+					return newPath, true
+				}
+			}
+		}
+	}
+
+	return "", false
+}
+
+func validateConfig(cfg *Config) error {
+	if cfg.MaxIdle < 1 || cfg.MaxIdle > 10800 {
+		return fmt.Errorf("maxidle must be between 1 and 10,800 seconds (3 hours), got %d", cfg.MaxIdle)
+	}
+	if cfg.Deadzone < 0 || cfg.Deadzone > 32767 {
+		return fmt.Errorf("deadzone must be between 0 and 32,767, got %d", cfg.Deadzone)
+	}
+	if len(cfg.Names) == 0 {
+		fmt.Println("Warning: no device names configured - daemon will idle with no matches")
+	}
 	return nil
 }
+
+// --- Event parsing ---
 
 // parseJsEvent parses 8 bytes from /dev/input/jsX into a JsEvent.
 func parseJsEvent(buf []byte) (JsEvent, error) {
@@ -225,7 +314,7 @@ func parseJsEvent(buf []byte) (JsEvent, error) {
 	}
 	return JsEvent{
 		Time:   binary.LittleEndian.Uint32(buf[0:4]),
-		Value:  int16(binary.LittleEndian.Uint16(buf[4:6])),
+		Value:  int16(binary.LittleEndian.Uint16(buf[4:6])), //nolint:gosec // G115: joystick axis value, always fits int16
 		Type:   buf[6],
 		Number: buf[7],
 	}, nil
@@ -253,8 +342,10 @@ func isSignificantEvent(ev JsEvent, deadzone int16) bool {
 	}
 }
 
-// parseInputDevicesFromReader parses the /proc/bus/input/devices format from any reader.
-func parseInputDevicesFromReader(r io.Reader) ([]Device, error) {
+// --- Device parsing ---
+
+// parseInputDevicesFromReader parses the /proc/bus/input/devices format.
+func parseInputDevicesFromReader(r io.Reader, names []string) ([]Device, error) {
 	var devices []Device
 	var currentDevice Device
 	scanner := bufio.NewScanner(r)
@@ -262,21 +353,20 @@ func parseInputDevicesFromReader(r io.Reader) ([]Device, error) {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
-		if strings.HasPrefix(line, "N: Name=") {
+		switch {
+		case strings.HasPrefix(line, "N: Name="):
 			currentDevice.Name = strings.Trim(line[len("N: Name="):], `"`)
-		} else if strings.HasPrefix(line, "U: Uniq=") {
+		case strings.HasPrefix(line, "U: Uniq="):
 			currentDevice.Uniq = strings.TrimSpace(line[len("U: Uniq="):])
-		} else if strings.HasPrefix(line, "H: Handlers=") {
+		case strings.HasPrefix(line, "H: Handlers="):
 			currentDevice.Handlers = strings.Fields(line[len("H: Handlers="):])
-		} else if line == "" && currentDevice.Name != "" {
+		case line == "" && currentDevice.Name != "":
 			for _, handler := range currentDevice.Handlers {
 				if strings.HasPrefix(handler, "js") {
-					for _, name := range specificNames {
-						if currentDevice.Name == name {
-							devices = append(devices, currentDevice)
-							break
-						}
+					if slices.Contains(names, currentDevice.Name) {
+						devices = append(devices, currentDevice)
 					}
+					break
 				}
 			}
 			currentDevice = Device{}
@@ -284,24 +374,26 @@ func parseInputDevicesFromReader(r io.Reader) ([]Device, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scanner error: %v", err)
+		return nil, fmt.Errorf("scanner error: %w", err)
 	}
 	return devices, nil
 }
 
-func parseInputDevices() ([]Device, error) {
+func parseInputDevices(names []string) ([]Device, error) {
 	file, err := os.Open("/proc/bus/input/devices")
 	if err != nil {
-		return nil, fmt.Errorf("failed to open devices: %v", err)
+		return nil, fmt.Errorf("failed to open devices: %w", err)
 	}
 	defer file.Close() //nolint:errcheck // read-only
-	return parseInputDevicesFromReader(file)
+	return parseInputDevicesFromReader(file, names)
 }
 
-func inputChecker(devPath string, uniq string, deviceEvent chan struct{}, quit chan bool, deadzone int16) {
-	fmt.Printf("Checking input on device: %s (%s)\n", uniq, devPath)
+// --- Device monitoring ---
 
-	file, err := os.Open(devPath)
+func inputChecker(devPath string, uniq string, deviceEvent chan struct{}, quit chan bool, deadzone int16) {
+	debugf("Checking input on device: %s (%s)", uniq, devPath)
+
+	file, err := os.Open(devPath) //nolint:gosec // G304: path from /proc/bus/input, not user-controlled
 	if err != nil {
 		fmt.Printf("Failed to open device %s: %v\n", uniq, err)
 		return
@@ -313,7 +405,7 @@ func inputChecker(devPath string, uniq string, deviceEvent chan struct{}, quit c
 	for {
 		select {
 		case <-quit:
-			fmt.Printf("Stopping input check for device %s\n", uniq)
+			debugf("Stopping input check for device %s", uniq)
 			return
 		default:
 			n, err := file.Read(buf)
@@ -351,7 +443,7 @@ func monitorDevice(devPath string, uniq string, maxIdle time.Duration, wg *sync.
 	for {
 		select {
 		case <-quit:
-			fmt.Printf("Stopping monitoring for device %s\n", uniq)
+			debugf("Stopping monitoring for device %s", uniq)
 			return
 		case <-deviceEvent:
 			idleSince = time.Now()
@@ -367,7 +459,7 @@ func monitorDevice(devPath string, uniq string, maxIdle time.Duration, wg *sync.
 }
 
 func disconnectDevice(uniq string) {
-	cmd := exec.Command("bluetoothctl", "disconnect", uniq)
+	cmd := exec.Command("bluetoothctl", "disconnect", uniq) //nolint:gosec,noctx // G204: uniq is BT MAC from /proc; no context needed for short-lived disconnect
 	err := cmd.Run()
 	if err != nil {
 		fmt.Printf("Failed to disconnect %s: %v\n", uniq, err)
@@ -376,69 +468,310 @@ func disconnectDevice(uniq string) {
 	}
 }
 
-func main() {
-	maxIdle := flag.Int("maxidletime", 3600, "Maximum idle time in seconds (1-10800)")
-	maxIdleShort := flag.Int("m", 3600, "Maximum idle time in seconds (1-10800)")
-	filePath := flag.String("devicefile", ".jstimeout.devices", "Path to the file with device names")
-	filePathShort := flag.String("d", ".jstimeout.devices", "Path to the file with device names")
-	deadzoneFlag := flag.Int("deadzone", 6000, "Axis deadzone threshold (0-32767)")
+// --- Setup diagnostics ---
 
-	flag.Parse()
-
-	// Validate deadzone
-	if *deadzoneFlag < 0 || *deadzoneFlag > 32767 {
-		fmt.Println("Error: deadzone must be between 0 and 32,767")
-		os.Exit(1)
+func isUserInGroup(groupName string) bool {
+	file, err := os.Open("/etc/group")
+	if err != nil {
+		return false
 	}
-	deadzone := int16(*deadzoneFlag)
+	defer file.Close() //nolint:errcheck // read-only
 
-	// Validate max idle time
-	idleValue := *maxIdle
-	if *maxIdleShort != 3600 {
-		idleValue = *maxIdleShort
-	}
-	if idleValue < 1 || idleValue > 10800 {
-		fmt.Println("Error: max idle time must be between 1 and 10,800 seconds (3 hours)")
-		os.Exit(1)
+	user := os.Getenv("USER")
+	if user == "" {
+		return false
 	}
 
-	// Resolve device file — use flag.Visit to detect if -d or -devicefile was explicitly set
-	deviceFilePath := *filePath
-	userOverride := false
-	flag.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "d":
-			deviceFilePath = *filePathShort
-			userOverride = true
-		case "devicefile":
-			userOverride = true
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, ":")
+		if len(parts) >= 4 && parts[0] == groupName {
+			members := strings.Split(parts[3], ",")
+			return slices.Contains(members, user)
 		}
-	})
-	deviceFilePath = resolveDeviceFile(deviceFilePath, userOverride)
+	}
+	return false
+}
 
-	fmt.Printf("Using device file: %s\n", deviceFilePath)
+func isGroupActiveInSession(groupName string) bool {
+	file, err := os.Open("/etc/group")
+	if err != nil {
+		return false
+	}
+	defer file.Close() //nolint:errcheck // read-only
 
-	// Load device names from file
-	if err := loadSpecificNames(deviceFilePath); err != nil {
-		fmt.Printf("Error loading device names: %v\n", err)
+	var targetGID int
+	found := false
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		parts := strings.Split(scanner.Text(), ":")
+		if len(parts) >= 3 && parts[0] == groupName {
+			if gid, err := strconv.Atoi(parts[2]); err == nil {
+				targetGID = gid
+				found = true
+			}
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+
+	groups, err := os.Getgroups()
+	if err != nil {
+		return false
+	}
+	return slices.Contains(groups, targetGID)
+}
+
+func runSetup(cfg Config, configPath string) {
+	fmt.Printf("\njstimeout v%s - diagnostics\n\n", version)
+	issues := 0
+
+	// Check js devices
+	jsDevices, _ := filepath.Glob("/dev/input/js*")
+	if len(jsDevices) == 0 {
+		fmt.Printf("%s No /dev/input/js* devices found (no controllers connected)\n", colorDim("[~]"))
+	} else {
+		anyDenied := false
+		for _, dev := range jsDevices {
+			f, err := os.Open(dev) //nolint:gosec // G304: glob of /dev/input/js*
+			if err != nil {
+				if os.IsPermission(err) {
+					fmt.Printf("%s %s - permission denied\n", colorRed("[✗]"), dev)
+					anyDenied = true
+					issues++
+				} else {
+					fmt.Printf("%s %s - %v\n", colorYellow("[!]"), dev, err)
+				}
+			} else {
+				fmt.Printf("%s %s readable\n", colorGreen("[✓]"), dev)
+				f.Close() //nolint:errcheck,gosec // read-only probe
+			}
+		}
+
+		// Only check group membership if access failed
+		if anyDenied {
+			if isUserInGroup("input") {
+				fmt.Printf("%s User in 'input' group (persistent)\n", colorGreen("[✓]"))
+			} else {
+				fmt.Printf("%s User not in 'input' group\n", colorRed("[✗]"))
+				fmt.Printf("    Run: sudo usermod -aG input $USER && re-login\n")
+				issues++
+			}
+			if isGroupActiveInSession("input") {
+				fmt.Printf("%s 'input' group active in session\n", colorGreen("[✓]"))
+			} else {
+				fmt.Printf("%s 'input' group not active in current session - re-login required\n", colorYellow("[!]"))
+			}
+		}
+	}
+
+	// Check bluetoothctl
+	btPath, err := exec.LookPath("bluetoothctl")
+	if err != nil {
+		fmt.Printf("%s bluetoothctl not found on PATH\n", colorRed("[✗]"))
+		fmt.Printf("    Install: sudo pacman -S bluez-utils\n")
+		issues++
+	} else {
+		fmt.Printf("%s bluetoothctl found: %s\n", colorGreen("[✓]"), btPath)
+	}
+
+	// Check config
+	if configPath != "" {
+		fmt.Printf("%s Config: %s\n", colorGreen("[✓]"), configPath)
+		fmt.Printf("    maxidle=%d  deadzone=%d  devices=%d\n", cfg.MaxIdle, cfg.Deadzone, len(cfg.Names))
+	} else {
+		fmt.Printf("%s No config found, using defaults\n", colorDim("[~]"))
+	}
+
+	// Check systemd service
+	home, _ := os.UserHomeDir()
+	servicePaths := []string{
+		"/usr/lib/systemd/user/jstimeout.service",
+		filepath.Join(home, ".config", "systemd", "user", "jstimeout.service"),
+	}
+	serviceFound := false
+	for _, p := range servicePaths {
+		if _, err := os.Stat(p); err == nil {
+			fmt.Printf("%s Systemd service: %s\n", colorGreen("[✓]"), p)
+			serviceFound = true
+			break
+		}
+	}
+	if !serviceFound {
+		fmt.Printf("%s No systemd user service found\n", colorDim("[~]"))
+	}
+
+	// Check for systemd override
+	if home != "" {
+		overrideDir := filepath.Join(home, ".config", "systemd", "user", "jstimeout.service.d")
+		if _, err := os.Stat(overrideDir); err == nil {
+			fmt.Printf("%s Systemd override detected: %s\n", colorYellow("[!]"), overrideDir)
+			fmt.Printf("    Check for renamed flags (v2.0.0: --maxidletime → --maxidle)\n")
+		}
+	}
+
+	fmt.Println()
+	if issues > 0 {
+		os.Exit(1)
+	}
+}
+
+// --- CLI ---
+
+func printHelp() {
+	fmt.Printf(`jstimeout v%s - auto-disconnect idle Bluetooth gamepads
+
+Usage: jstimeout [options]
+
+Options:
+  -m, --maxidle SEC    Idle timeout in seconds (1-10800, default: from config or 3600)
+  -z, --deadzone VAL   Axis deadzone threshold (0-32767, default: from config or 6000)
+  -c, --config PATH    Path to config file
+  -v, --verbose        Enable debug logging
+  -V, --version        Print version and exit
+      --setup          Run diagnostics (check permissions, config, systemd)
+  -h, --help           Print this help
+
+Config file (INI format):
+  Lookup order:
+    1. --config flag
+    2. ~/.config/jstimeout/config
+    3. /etc/jstimeout/config
+    4. Auto-copy from /usr/share/jstimeout/config.example
+
+  Example:
+    [settings]
+    maxidle = 1800
+    deadzone = 6000
+
+    [devices]
+    Sony PLAYSTATION(R)3 Controller
+    Xbox Wireless Controller
+
+  CLI flags override config file values.
+
+Legacy device files (.jstimeout.devices, ~/.config/jstimeout/devices) are
+automatically migrated to the new config format on first run.
+`, version)
+}
+
+func main() {
+	// Parse CLI args
+	var (
+		maxIdleFlag  = -1
+		deadzoneFlag = -1
+		configFlag   string
+		setupMode    bool
+	)
+
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--maxidle", "-m":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "Error: --maxidle requires a value")
+				os.Exit(1)
+			}
+			i++
+			n, err := strconv.Atoi(args[i])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid --maxidle value: %s\n", args[i])
+				os.Exit(1)
+			}
+			maxIdleFlag = n
+		case "--deadzone", "-z":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "Error: --deadzone requires a value")
+				os.Exit(1)
+			}
+			i++
+			n, err := strconv.Atoi(args[i])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid --deadzone value: %s\n", args[i])
+				os.Exit(1)
+			}
+			deadzoneFlag = n
+		case "--config", "-c":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "Error: --config requires a path")
+				os.Exit(1)
+			}
+			i++
+			configFlag = args[i]
+		case "--verbose", "-v":
+			verbose = true
+		case "--version", "-V":
+			fmt.Printf("jstimeout v%s\n", version)
+			os.Exit(0)
+		case "--setup":
+			setupMode = true
+		case "--help", "-h":
+			printHelp()
+			os.Exit(0)
+		default:
+			fmt.Fprintf(os.Stderr, "Error: unknown flag: %s\nRun 'jstimeout --help' for usage.\n", args[i])
+			os.Exit(1)
+		}
+	}
+
+	// Load config
+	var cfg Config
+	configPath, found := resolveConfig(configFlag)
+
+	if found {
+		var err error
+		cfg, err = loadConfig(configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading config %s: %v\n", configPath, err)
+			os.Exit(1)
+		}
+		debugf("Loaded config: %s", configPath)
+	} else {
+		cfg = defaultConfig()
+		debugf("No config found, using defaults")
+	}
+
+	// CLI flags override config
+	if maxIdleFlag >= 0 {
+		cfg.MaxIdle = maxIdleFlag
+	}
+	if deadzoneFlag >= 0 {
+		cfg.Deadzone = deadzoneFlag
+	}
+
+	// Setup mode
+	if setupMode {
+		runSetup(cfg, configPath)
 		return
 	}
 
-	// Print the device names on startup
-	fmt.Println("Loaded device names:")
-	for _, name := range specificNames {
-		fmt.Println(" -", name)
+	// Validate
+	if err := validateConfig(&cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 
-	idleDuration := time.Duration(idleValue) * time.Second
-	fmt.Printf("Max idle time set to: %v seconds\n", idleDuration.Seconds())
-	fmt.Printf("Axis deadzone set to: %d\n", deadzone)
+	debugf("Using config: %s", configPath)
+	debugf("Loaded device names:")
+	for _, name := range cfg.Names {
+		debugf("  - %s", name)
+	}
+	debugf("Max idle time: %ds | Deadzone: %d", cfg.MaxIdle, cfg.Deadzone)
+
+	deadzone := int16(cfg.Deadzone) //nolint:gosec // G115: validated 0-32767 above
+	idleDuration := time.Duration(cfg.MaxIdle) * time.Second
+
+	// Always print summary (single line, journalctl-friendly)
+	fmt.Printf("Started: %d devices, maxidle=%ds, deadzone=%d\n", len(cfg.Names), cfg.MaxIdle, cfg.Deadzone)
 
 	deviceQuitChannels := make(map[string]chan bool)
 	var mu sync.Mutex
 
 	for {
-		devices, err := parseInputDevices()
+		devices, err := parseInputDevices(cfg.Names)
 		if err != nil {
 			fmt.Printf("Error parsing devices: %v\n", err)
 			time.Sleep(5 * time.Second)

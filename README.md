@@ -1,35 +1,83 @@
 # jstimeout
 
-Program to automatically disconnect bluetooth gamepads when there is no activity for a specified time. It matches `/dev/input` with bluetooth MAC addresses to force a BT disconnect.
+Daemon that auto-disconnects idle Bluetooth gamepads after a configurable timeout. Monitors `/dev/input/jsX` events and uses `bluetoothctl` to force a BT disconnect when no input is detected.
 
-Originally written for DS3 controllers, whose timeout cannot be configured without a PS3 due to a proprietary timeout implementation by Sony, but works with any controller listed in the devices file.
+Originally written for DS3 controllers, whose timeout can't be configured without a PS3 due to Sony's proprietary implementation, but works with any controller listed in the config.
 
 ## Usage
 
 ```
-jstimeout [-m|-maxidletime <seconds>] [-d|-devicefile <path>] [-deadzone <threshold>]
+jstimeout [options]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-m`, `-maxidletime` | `3600` (1h) | Idle time in seconds before disconnect (1-10800) |
-| `-d`, `-devicefile` | `.jstimeout.devices` | Path to the file with device names |
-| `-deadzone` | `6000` (~18%) | Axis deadzone threshold (0-32767); events below this are ignored as stick drift |
+| `-m`, `--maxidle` | `3600` (1h) | Idle time in seconds before disconnect (1-10800) |
+| `-z`, `--deadzone` | `6000` (~18%) | Axis deadzone threshold (0-32767); events below this are ignored as stick drift |
+| `-c`, `--config` | (auto-resolved) | Path to config file |
+| `-v`, `--verbose` | off | Enable debug logging |
+| `-V`, `--version` | | Print version and exit |
+| `--setup` | | Run diagnostics (permissions, config, systemd) |
+| `-h`, `--help` | | Print help |
 
-## Device List Setup
+CLI flags override config file values.
 
-Without `-d`, the program looks for the device list in this order:
+## Configuration
 
-1. `.jstimeout.devices` in the current working directory
-2. `~/.config/jstimeout/devices`
+Config file uses INI format with two sections:
 
-If neither exists and the package-provided example (`/usr/share/jstimeout/devices.example`) is available, it is automatically copied to `~/.config/jstimeout/devices` on first run.
+```ini
+# ~/.config/jstimeout/config
 
-Add device names as they appear in `/proc/bus/input/devices`, one per line.
+[settings]
+maxidle = 3600      # idle timeout in seconds (1-10800)
+deadzone = 6000     # axis deadzone threshold (0-32767)
 
-```
+[devices]
+# Controller names from /proc/bus/input/devices (N: Name= field)
 Sony PLAYSTATION(R)3 Controller
 Sony Computer Entertainment Wireless Controller
+```
+
+### Config file lookup order
+
+1. `--config` flag
+2. `~/.config/jstimeout/config`
+3. `/etc/jstimeout/config`
+4. Auto-copy from `/usr/share/jstimeout/config.example`
+
+### Migrating from v1
+
+v1 used a plain device-names file (`.jstimeout.devices` or `~/.config/jstimeout/devices`). On first run, v2 automatically converts any legacy file found to the new config format and renames the old file to `.v1.bak`. No manual steps required.
+
+v2 also renamed flags:
+
+| v1 | v2 |
+|----|----|
+| `-maxidletime`, `-m` | `--maxidle`, `-m` |
+| `-devicefile`, `-d` | removed (use `--config`, `-c`) |
+| `-deadzone` | `--deadzone`, `-z` |
+
+If you have a systemd override with old flags, update it:
+
+```sh
+systemctl --user edit jstimeout
+```
+
+## Diagnostics
+
+Run `--setup` to check permissions, config, and systemd:
+
+```
+$ jstimeout --setup
+
+jstimeout v2.0.0 - diagnostics
+
+[✓] /dev/input/js0 readable
+[✓] bluetoothctl found: /usr/bin/bluetoothctl
+[✓] Config: /home/user/.config/jstimeout/config
+    maxidle=3600  deadzone=6000  devices=2
+[✓] Systemd service: /usr/lib/systemd/user/jstimeout.service
 ```
 
 ## Installation
@@ -41,7 +89,7 @@ yay -S jstimeout-bin   # pre-built binary from GitHub release
 yay -S jstimeout-git   # build from latest source
 ```
 
-To auto-update `-git` packages when upstream changes, enable devel checking:
+To auto-update `-git` packages when upstream changes:
 
 ```sh
 yay --devel --save
@@ -49,31 +97,31 @@ yay --devel --save
 
 ### From source
 
+Requires Go 1.21+.
+
 ```sh
 git clone https://github.com/0x90shell/jstimeout.git
 cd jstimeout
-go build -o jstimeout jstimeout.go
+go build -o jstimeout .
 sudo install -Dm755 jstimeout /usr/bin/jstimeout
-sudo install -Dm644 .jstimeout.devices /usr/share/jstimeout/devices.example
+sudo install -Dm644 config /usr/share/jstimeout/config.example
 sudo install -Dm644 jstimeout.service /usr/lib/systemd/user/jstimeout.service
 ```
 
 ## Systemd User Service
-
-To enable:
 
 ```sh
 systemctl --user enable --now jstimeout
 journalctl --user -u jstimeout -b -e -f  # view logs
 ```
 
-The service waits 10 seconds before starting to give the Bluetooth subsystem time to initialize. The default idle timeout is 1 hour. To change it, create a systemd override:
+The service waits 10 seconds before starting to give the Bluetooth subsystem time to initialize.
+
+To customize the timeout without editing the config file, create a systemd override:
 
 ```sh
 systemctl --user edit jstimeout
 ```
-
-Then add:
 
 ```ini
 [Service]
@@ -81,25 +129,24 @@ ExecStart=
 ExecStart=/usr/bin/jstimeout -m 1800
 ```
 
-The blank `ExecStart=` line is required to clear the default before setting your own.
+The blank `ExecStart=` clears the default before setting your own.
 
-### Option 2: UDev Service Launch
+### UDev launch (alternative)
 
-Option 2 entails needing root access to modify udev rules so the process is initiated only when specific devices are connected. This is a great way to minimize running processes, but it does not stop when controllers are gone which mitigates the benefit. The binary uses very minimal resources so it doesn't seem like a major problem to leave it running all the time via Option 1.
+You can launch jstimeout via udev rules when specific devices connect instead of running it as a persistent service. This minimizes running processes but does not stop when controllers disconnect. The binary uses minimal resources, so a persistent service (above) is usually simpler.
 
-The solution to have it terminate on disconnect entails creating systemd devices or modifying the program to terminate when no devices are present. To make the udev solution work, you will need to modify and maintain udev rules should you add new devices.
+`/etc/udev/rules.d/99-jstimeout.rules`:
 
-The below rules will launch the existing user service configured above. You'll want to disable auto-launch (`disable`) the user service. `StopWhenNeeded` was explored as an option for stopping the systemd service, but it did not make the service terminate when devices disconnected.
-
-`/etc/udev/rules.d/99-jstimeout.rules`
 ```
-# Rule for launching the jstimeout program for specific gamepads
 SUBSYSTEM=="input", ATTRS{name}=="Sony PLAYSTATION(R)3 Controller", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="jstimeout.service"
 SUBSYSTEM=="input", ATTRS{name}=="Sony Computer Entertainment Wireless Controller", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="jstimeout.service"
 ```
 
 ```sh
 udevadm control --reload-rules
-systemctl restart systemd-udevd.service
 udevadm monitor --environment --udev  # verify on device connection
 ```
+
+## License
+
+MIT

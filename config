@@ -1,0 +1,15 @@
+# jstimeout configuration
+# CLI flags override these values
+
+[settings]
+maxidle = 3600      # idle timeout in seconds (1-10800)
+deadzone = 6000     # axis deadzone threshold (0-32767)
+
+[devices]
+# Controller names from /proc/bus/input/devices (N: Name= field)
+# One per line — uncomment or add your controllers
+Sony PLAYSTATION(R)3 Controller
+Sony Computer Entertainment Wireless Controller
+# Xbox Wireless Controller
+# DualSense Wireless Controller
+# 8BitDo SN30 Pro
